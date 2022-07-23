@@ -53,8 +53,6 @@ using internal::checked_cast;
 
 namespace dataset {
 
-using FragmentGenerator = std::function<Future<std::shared_ptr<Fragment>>()>;
-
 std::vector<FieldRef> ScanOptions::MaterializedFields() const {
   std::vector<FieldRef> fields;
 
@@ -298,12 +296,7 @@ class OneShotFragment : public Fragment {
 };
 
 Result<FragmentGenerator> AsyncScanner::GetFragments() const {
-  // TODO(ARROW-8163): Async fragment scanning will return AsyncGenerator<Fragment>
-  // here. Current iterator based versions are all fast & sync so we will just ToVector
-  // it
-  ARROW_ASSIGN_OR_RAISE(auto fragments_it, dataset_->GetFragments(scan_options_->filter));
-  ARROW_ASSIGN_OR_RAISE(auto fragments_vec, fragments_it.ToVector());
-  return MakeVectorGenerator(std::move(fragments_vec));
+  return dataset_->GetFragmentsAsync(scan_options_->filter);
 }
 
 Result<TaggedRecordBatchIterator> AsyncScanner::ScanBatches() {

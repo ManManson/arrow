@@ -16,6 +16,7 @@
 // under the License.
 
 #include "arrow/dataset/dataset.h"
+#include <arrow/util/async_generator.h>
 
 #include <memory>
 #include <utility>
@@ -158,6 +159,26 @@ Result<FragmentIterator> Dataset::GetFragments(compute::Expression predicate) {
       predicate, SimplifyWithGuarantee(std::move(predicate), partition_expression_));
   return predicate.IsSatisfiable() ? GetFragmentsImpl(std::move(predicate))
                                    : MakeEmptyIterator<std::shared_ptr<Fragment>>();
+}
+
+Result<FragmentGenerator> Dataset::GetFragmentsAsync() {
+  return GetFragmentsAsync(compute::literal(true));
+}
+
+Result<FragmentGenerator> Dataset::GetFragmentsAsync(compute::Expression predicate) {
+  ARROW_ASSIGN_OR_RAISE(
+      predicate, SimplifyWithGuarantee(std::move(predicate), partition_expression_));
+  return predicate.IsSatisfiable()
+             ? GetFragmentsAsyncImpl(std::move(predicate))
+             : MakeEmptyGenerator<FragmentGenerator::result_type::ValueType>();
+}
+
+// Default impl delegating the work to `GetFragmentsImpl` and wrapping it into a
+// VectorGenerator
+Result<FragmentGenerator> Dataset::GetFragmentsAsyncImpl(compute::Expression predicate) {
+  ARROW_ASSIGN_OR_RAISE(auto iter, GetFragmentsImpl(std::move(predicate)));
+  ARROW_ASSIGN_OR_RAISE(auto vec, iter.ToVector());
+  return MakeVectorGenerator(std::move(vec));
 }
 
 struct VectorRecordBatchGenerator : InMemoryDataset::RecordBatchGenerator {

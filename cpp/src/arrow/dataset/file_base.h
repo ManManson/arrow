@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include <arrow/util/async_generator.h>
 #include <functional>
 #include <memory>
 #include <string>
@@ -243,6 +244,12 @@ class ARROW_DS_EXPORT FileSystemDataset : public Dataset {
       std::vector<std::shared_ptr<FileFragment>> fragments,
       std::shared_ptr<Partitioning> partitioning = NULLPTR);
 
+  static Result<std::shared_ptr<FileSystemDataset>> Make(
+      std::shared_ptr<Schema> schema, compute::Expression root_partition,
+      std::shared_ptr<FileFormat> format, std::shared_ptr<fs::FileSystem> filesystem,
+      FragmentGenerator fragment_gen,
+      std::shared_ptr<Partitioning> partitioning = NULLPTR);
+
   /// \brief Write a dataset.
   static Status Write(const FileSystemDatasetWriteOptions& write_options,
                       std::shared_ptr<Scanner> scanner);
@@ -279,6 +286,12 @@ class ARROW_DS_EXPORT FileSystemDataset : public Dataset {
                     compute::Expression partition_expression)
       : Dataset(std::move(schema), partition_expression) {}
 
+  FileSystemDataset(std::shared_ptr<Schema> schema,
+                    compute::Expression partition_expression,
+                    FragmentGenerator fragment_gen)
+      : Dataset(std::move(schema), std::move(partition_expression)),
+        fragment_gen_(std::move(fragment_gen)) {}
+
   Result<FragmentIterator> GetFragmentsImpl(compute::Expression predicate) override;
 
   void SetupSubtreePruning();
@@ -289,6 +302,8 @@ class ARROW_DS_EXPORT FileSystemDataset : public Dataset {
   std::shared_ptr<Partitioning> partitioning_;
 
   std::shared_ptr<FragmentSubtrees> subtrees_;
+
+  FragmentGenerator fragment_gen_;
 };
 
 /// \brief Options for writing a file of this format.

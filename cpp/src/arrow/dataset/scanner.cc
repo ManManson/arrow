@@ -375,11 +375,6 @@ Result<EnumeratedRecordBatchGenerator> AsyncScanner::ScanBatchesUnorderedAsync(
 
   RETURN_NOT_OK(plan->StartProducing());
 
-  auto options = scan_options_;
-  ARROW_ASSIGN_OR_RAISE(auto fragments_it, dataset_->GetFragments(scan_options_->filter));
-  ARROW_ASSIGN_OR_RAISE(auto fragments, fragments_it.ToVector());
-  auto shared_fragments = std::make_shared<FragmentVector>(std::move(fragments));
-
   // If the generator is destroyed before being completely drained, inform plan
   std::shared_ptr<void> stop_producing{
       nullptr, [plan, exec_context](...) {
@@ -391,6 +386,16 @@ Result<EnumeratedRecordBatchGenerator> AsyncScanner::ScanBatchesUnorderedAsync(
         }
       }};
 
+  auto options = scan_options_;
+  ARROW_ASSIGN_OR_RAISE(auto fragment_gen,
+                        dataset_->GetFragmentsAsync(scan_options_->filter));
+  // FIXME: crutch!
+  auto collected_fragments = CollectAsyncGenerator(fragment_gen);
+  ARROW_ASSIGN_OR_RAISE(auto fragment_vec, collected_fragments.MoveResult());
+  std::shared_ptr<FragmentVector> shared_fragments =
+      std::make_shared<FragmentVector>(fragment_vec);
+
+  // TODO: get rid of `shared_fragments` here...
   return MakeMappedGenerator(
       std::move(sink_gen),
       [sink_gen, options, stop_producing,
@@ -868,10 +873,8 @@ Result<compute::ExecNode*> MakeScanNode(compute::ExecPlan* plan,
 
   RETURN_NOT_OK(NormalizeScanOptions(scan_options, dataset->schema()));
 
-  // using a generator for speculative forward compatibility with async fragment discovery
-  ARROW_ASSIGN_OR_RAISE(auto fragments_it, dataset->GetFragments(scan_options->filter));
-  ARROW_ASSIGN_OR_RAISE(auto fragments_vec, fragments_it.ToVector());
-  auto fragment_gen = MakeVectorGenerator(std::move(fragments_vec));
+  ARROW_ASSIGN_OR_RAISE(auto fragment_gen,
+                        dataset->GetFragmentsAsync(scan_options->filter));
 
   ARROW_ASSIGN_OR_RAISE(auto batch_gen_gen,
                         FragmentsToBatches(std::move(fragment_gen), scan_options));

@@ -169,6 +169,19 @@ Result<std::shared_ptr<FileSystemDataset>> FileSystemDataset::Make(
   return out;
 }
 
+Result<std::shared_ptr<FileSystemDataset>> FileSystemDataset::Make(
+    std::shared_ptr<Schema> schema, compute::Expression root_partition,
+    std::shared_ptr<FileFormat> format, std::shared_ptr<fs::FileSystem> filesystem,
+    FragmentGenerator fragment_gen, std::shared_ptr<Partitioning> partitioning) {
+  std::shared_ptr<FileSystemDataset> out(new FileSystemDataset(
+      std::move(schema), std::move(root_partition), std::move(fragment_gen)));
+  out->format_ = std::move(format);
+  out->filesystem_ = std::move(filesystem);
+  out->partitioning_ = std::move(partitioning);
+  out->SetupSubtreePruning();
+  return out;
+}
+
 Result<std::shared_ptr<Dataset>> FileSystemDataset::ReplaceSchema(
     std::shared_ptr<Schema> schema) const {
   RETURN_NOT_OK(CheckProjectable(*schema_, *schema));
@@ -265,6 +278,11 @@ Result<FragmentIterator> FileSystemDataset::GetFragmentsImpl(
                  [this](int i) { return fragments_[i]; });
 
   return MakeVectorIterator(std::move(fragments));
+}
+
+Result<FragmentGenerator> FileSystemDataset::GetFragmentsAsyncImpl(
+    compute::Expression /*predicate*/) {
+  return fragment_gen_;
 }
 
 Status FileWriter::Write(RecordBatchReader* batches) {

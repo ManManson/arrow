@@ -293,6 +293,7 @@ class ARROW_DS_EXPORT FileSystemDataset : public Dataset {
         fragment_gen_(std::move(fragment_gen)) {}
 
   Result<FragmentIterator> GetFragmentsImpl(compute::Expression predicate) override;
+  Result<FragmentGenerator> GetFragmentsAsyncImpl(compute::Expression predicate) override;
 
   void SetupSubtreePruning();
 

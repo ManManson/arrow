@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <arrow/filesystem/type_fwd.h>
 #include <chrono>
 #include <cstring>
 #include <sstream>
@@ -29,6 +30,8 @@
 #include <sys/stat.h>
 #endif
 
+#include "arrow/dataset/discovery.h"
+#include "arrow/dataset/file_parquet.h"
 #include "arrow/filesystem/localfs.h"
 #include "arrow/filesystem/path_util.h"
 #include "arrow/filesystem/util_internal.h"
@@ -308,6 +311,169 @@ Result<std::vector<FileInfo>> LocalFileSystem::GetFileInfo(const FileSelector& s
   RETURN_NOT_OK(StatSelector(fn, select, 0, &results));
   return results;
 }
+
+namespace {
+
+struct StatOptions {
+  /// Invalid files (via selector or explicitly) will be excluded by checking
+  /// with the FileFormat::IsSupported method.  This will incur IO for each files
+  /// in a serial and single threaded fashion. Disabling this feature will skip the
+  /// IO, but unsupported files may be present in the Dataset
+  /// (resulting in an error at scan time).
+  bool exclude_invalid_files = false;
+
+  /// When discovering from a Selector (and not from an explicit file list), ignore
+  /// files and directories matching any of these prefixes.
+  ///
+  /// Example (with selector = "/dataset/**"):
+  /// selector_ignore_prefixes = {"_", ".DS_STORE" };
+  ///
+  /// - "/dataset/data.csv" -> not ignored
+  /// - "/dataset/_metadata" -> ignored
+  /// - "/dataset/.DS_STORE" -> ignored
+  /// - "/dataset/_hidden/dat" -> ignored
+  /// - "/dataset/nested/.DS_STORE" -> ignored
+  std::vector<std::string> selector_ignore_prefixes = {
+      ".",
+      "_",
+  };
+};
+
+using SinglePartitionGenerator = AsyncGenerator<fs::FileInfo>;
+using SinglePartitionPushGenerator = PushGenerator<SinglePartitionGenerator>;
+using SinglePartitionProducer = SinglePartitionPushGenerator::Producer;
+using PartitionsGenerator = AsyncGenerator<SinglePartitionGenerator>;
+
+class AsyncStatSelector {
+ public:
+  Result<PartitionsGenerator> DiscoverPartitions(
+      std::shared_ptr<arrow::fs::FileSystem> filesystem, arrow::fs::FileSelector selector,
+      const dataset::ParquetFileFormat& format, const StatOptions& opts) {
+    PushGenerator<SinglePartitionGenerator> file_gen;
+    // Pass producer to StatSelectorImpl
+    ARROW_RETURN_NOT_OK(StatSelectorImpl());
+    return file_gen;
+  }
+
+ private:
+  class DiscoveryImplIterator {
+    PlatformFilename dir_fn_;
+    int32_t nesting_depth_;
+    bool initialized_ = false;
+    std::vector<PlatformFilename> child_fns_;
+    size_t idx_ = 0;
+
+    using FilterFn = std::function<bool(fs::FileInfo&)>;
+    FilterFn filter_;
+
+    SinglePartitionProducer& partition_producer_;
+    FileSelector selector_;
+
+   public:
+    DiscoveryImplIterator(PlatformFilename dir_fn, int32_t nesting_depth)
+        : dir_fn_(std::move(dir_fn)), nesting_depth_(nesting_depth) {}
+
+    Result<fs::FileInfo> Next() {
+      if (!initialized_) {
+        auto result = arrow::internal::ListDir(dir_fn_);
+        if (!result.ok()) {
+          auto status = result.status();
+          if (selector_.allow_not_found && status.IsIOError()) {
+            auto exists = FileExists(dir_fn_);
+            if (exists.ok() && !*exists) {
+              return Finish();
+            } else {
+              return Finish(
+                  exists.ok() ? arrow::Status::UnknownError(
+                                    "Failed to discover directory: ", dir_fn_.ToNative())
+                              : exists.status());
+            }
+          }
+          return Finish(status);
+        }
+        child_fns_ = std::move(result.MoveValueUnsafe());
+        initialized_ = true;
+      }
+      while (idx_ < child_fns_.size()) {
+        auto full_fn = dir_fn_.Join(child_fns_[idx_++]);
+        auto res = StatFile(full_fn.ToNative());
+        if (!res.ok()) {
+          return Finish(res.status());
+        }
+
+        auto info = res.MoveValueUnsafe();
+
+        if (info.type() == fs::FileType::Directory &&
+            nesting_depth_ < selector_.max_recursion && selector_.recursive) {
+          // вот здесь запускается в том же тредпуле еще один дискавери, точнее,
+          // конструируется итератор в субдиректории и из него делается генератор
+          // далее пушатся данные из этого генератора в общий синк.
+          //
+          // тут фишка в том, что opts является супер-аргументом, который не только
+          // options передает, но также и сам синк, а его, по идее, надо бы перекидывать
+          // явно
+          auto status = PerformDiscovery(full_fn, nesting_depth_ + 1,
+                                         std::ref(partition_producer_));
+          if (!status.ok()) {
+            return Finish(status);
+          }
+          continue;
+        }
+
+        auto check = filter_(info);
+        if (!check.ok()) {
+          return Finish(check.status());
+        } else if (*check) {
+          return fs::FileInfo(info);
+        } else {
+          continue;
+        }
+      }
+
+      return Finish();
+    }
+
+   private:
+    Result<fs::FileInfo> Finish(Status status = Status::OK()) {
+      assert(partition_producer_.Close());
+      ARROW_RETURN_NOT_OK(status);
+      return IterationTraits<fs::FileInfo>::End();  // FIXME: FileInfoOpt!
+    }
+  };
+
+  // Create a DiscoveryImplIterator under the hood, convert to a generator
+  // feed it to the outer PushGenerator's producer queue (Discover(3))
+  static Status PerformDiscovery(SinglePartitionProducer& partition_producer);
+
+  // Workhorse for discovery algorithm (DiscoverPartitionFiles)
+  Status StatSelectorImpl() { return Status::OK(); }
+
+  static bool FileFilter(fs::FileInfo& info, std::shared_ptr<fs::FileSystem> filesystem,
+                         const fs::FileSelector& selector,
+                         const dataset::ParquetFileFormat& format,
+                         const StatOptions& opts) {
+    if (!opts.exclude_invalid_files) {
+      return true;
+    }
+    if (!info.IsFile()) {
+      return false;
+    };
+    auto relative = fs::internal::RemoveAncestor(selector.base_dir, info.path());
+    if (dataset::StartsWithAnyOf(std::string(*relative), opts.selector_ignore_prefixes)) {
+      return false;
+    }
+    auto res = format.IsSupported({info, filesystem});
+    if (!res.ok()) {
+      return false;
+    }
+    return res.ValueUnsafe();
+  }
+};
+
+}  // anonymous namespace
+
+// FileInfoGenerator LocalFileSystem::GetFileInfoGenerator(const FileSelector& select)
+// {}
 
 Status LocalFileSystem::CreateDir(const std::string& path, bool recursive) {
   RETURN_NOT_OK(ValidatePath(path));

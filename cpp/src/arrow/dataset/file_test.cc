@@ -149,8 +149,9 @@ TEST_F(TestFileSystemDataset, Basic) {
 TEST_F(TestFileSystemDataset, ReplaceSchema) {
   auto schm = schema({field("i32", int32()), field("f64", float64())});
   auto format = std::make_shared<DummyFileFormat>(schm);
-  ASSERT_OK_AND_ASSIGN(auto dataset,
-                       FileSystemDataset::Make(schm, literal(true), format, nullptr, {}));
+  ASSERT_OK_AND_ASSIGN(auto dataset, FileSystemDataset::Make(
+                                         schm, literal(true), format, nullptr,
+                                         std::vector<std::shared_ptr<FileFragment>>{}));
 
   // drop field
   auto new_schema = schema({field("i32", int32())});

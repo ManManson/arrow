@@ -152,7 +152,8 @@ Result<std::shared_ptr<DatasetFactory>> FileSystemDatasetFactory::Make(
                                    std::move(format), std::move(options)));
 }
 
-bool StartsWithAnyOf(const std::string& path, const std::vector<std::string>& prefixes) {
+static bool StartsWithAnyOf(const std::string& path,
+                            const std::vector<std::string>& prefixes) {
   if (prefixes.empty()) {
     return false;
   }

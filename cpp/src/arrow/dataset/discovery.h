@@ -267,7 +267,5 @@ class ARROW_DS_EXPORT FileSystemDatasetFactory : public DatasetFactory {
   FileSystemFactoryOptions options_;
 };
 
-bool StartsWithAnyOf(const std::string& path, const std::vector<std::string>& prefixes);
-
 }  // namespace dataset
 }  // namespace arrow

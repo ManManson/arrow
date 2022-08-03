@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <arrow/filesystem/filesystem.h>
 #include <arrow/filesystem/type_fwd.h>
 #include <arrow/io/type_fwd.h>
 #include <arrow/status.h>
@@ -356,7 +357,7 @@ struct StatOptions {
   int32_t partitions_readahead = 1;
 };
 
-using SinglePartitionGenerator = AsyncGenerator<FileInfo>;
+using SinglePartitionGenerator = AsyncGenerator<FileInfoVector>;
 using SinglePartitionPushGenerator = PushGenerator<SinglePartitionGenerator>;
 using SinglePartitionProducer = SinglePartitionPushGenerator::Producer;
 using PartitionsGenerator = AsyncGenerator<SinglePartitionGenerator>;
@@ -365,13 +366,12 @@ class AsyncStatSelector {
  public:
   using FilterFn = std::function<Result<bool>(const FileInfo&)>;
 
-  static Result<PartitionsGenerator> DiscoverPartitions(
-      std::shared_ptr<FileSystem> filesystem, FileSelector selector,
-      const StatOptions& opts) {
+  static Result<PartitionsGenerator> DiscoverPartitions(FileSelector selector,
+                                                        const StatOptions& opts) {
     PushGenerator<SinglePartitionGenerator> file_gen;
 
-    auto filter_fn = [filesystem, selector, &opts](const FileInfo& info) {
-      return FileFilter(info, filesystem, selector, opts);
+    auto filter_fn = [selector, &opts](const FileInfo& info) {
+      return FileFilter(info, selector, opts);
     };
 
     ARROW_ASSIGN_OR_RAISE(
@@ -383,10 +383,8 @@ class AsyncStatSelector {
   }
 
   static arrow::Result<SinglePartitionGenerator> DiscoverPartitionsFlattened(
-      std::shared_ptr<FileSystem> filesystem, FileSelector selector,
-      const StatOptions& opts) {
-    ARROW_ASSIGN_OR_RAISE(auto part_gen,
-                          DiscoverPartitions(filesystem, std::move(selector), opts));
+      FileSelector selector, const StatOptions& opts) {
+    ARROW_ASSIGN_OR_RAISE(auto part_gen, DiscoverPartitions(std::move(selector), opts));
     return opts.partitions_readahead > 1
                ? MakeSequencedMergedGenerator(std::move(part_gen),
                                               opts.partitions_readahead)
@@ -395,6 +393,8 @@ class AsyncStatSelector {
 
  private:
   class DiscoveryImplIterator {
+    static constexpr size_t batch_size = 1000;
+
     PlatformFilename dir_fn_;
     int32_t nesting_depth_;
     bool initialized_ = false;
@@ -406,6 +406,8 @@ class AsyncStatSelector {
     SinglePartitionProducer partition_producer_;
     FileSelector selector_;
 
+    FileInfoVector current_chunk_;
+
    public:
     DiscoveryImplIterator(PlatformFilename dir_fn, int32_t nesting_depth, FilterFn filter,
                           FileSelector selector,
@@ -414,9 +416,11 @@ class AsyncStatSelector {
           nesting_depth_(nesting_depth),
           filter_(std::move(filter)),
           partition_producer_(std::move(partition_producer)),
-          selector_(std::move(selector)) {}
+          selector_(std::move(selector)) {
+      current_chunk_.reserve(batch_size);
+    }
 
-    Result<FileInfo> Next() {
+    Result<FileInfoVector> Next() {
       if (!initialized_) {
         auto result = arrow::internal::ListDir(dir_fn_);
         if (!result.ok()) {
@@ -468,18 +472,28 @@ class AsyncStatSelector {
         if (!check.ok()) {
           return Finish(check.status());
         } else if (*check) {
-          return FileInfo(info);
+          current_chunk_.emplace_back(std::move(info));
+          if (current_chunk_.size() == batch_size) {
+            auto yielded_vec = current_chunk_;
+            current_chunk_.clear();
+            return yielded_vec;
+          }
         }
         continue;
+      }
+      if (!current_chunk_.empty()) {
+        auto yielded_vec = current_chunk_;
+        current_chunk_.clear();
+        return yielded_vec;
       }
       return Finish();
     }
 
    private:
-    Result<FileInfo> Finish(Status status = Status::OK()) {
+    Result<FileInfoVector> Finish(Status status = Status::OK()) {
       partition_producer_.Close();
       ARROW_RETURN_NOT_OK(status);
-      return IterationEnd<FileInfo>();
+      return IterationEnd<FileInfoVector>();
     }
   };
 
@@ -493,7 +507,7 @@ class AsyncStatSelector {
 
     ARROW_ASSIGN_OR_RAISE(
         auto gen,
-        MakeBackgroundGenerator(Iterator<FileInfo>(DiscoveryImplIterator(
+        MakeBackgroundGenerator(Iterator<FileInfoVector>(DiscoveryImplIterator(
                                     std::move(dir_fn), nesting_depth, std::move(filter),
                                     std::move(selector), partition_producer)),
                                 io::default_io_context().executor()));
@@ -503,9 +517,8 @@ class AsyncStatSelector {
     return arrow::Status::OK();
   }
 
-  static Result<bool> FileFilter(const FileInfo& info,
-                                 std::shared_ptr<FileSystem> filesystem,
-                                 const FileSelector& selector, const StatOptions& opts) {
+  static Result<bool> FileFilter(const FileInfo& info, const FileSelector& selector,
+                                 const StatOptions& opts) {
     if (!opts.exclude_invalid_files) {
       return true;
     }
@@ -528,20 +541,24 @@ class AsyncStatSelector {
 
 Result<std::vector<FileInfo>> LocalFileSystem::GetFileInfo(const FileSelector& select) {
   RETURN_NOT_OK(ValidatePath(select.base_dir));
-  ARROW_ASSIGN_OR_RAISE(auto fileinfo_gen,
-                        AsyncStatSelector::DiscoverPartitionsFlattened(
-                            shared_from_this(), select, StatOptions{}));
-  return CollectAsyncGenerator(fileinfo_gen).MoveResult();
+  ARROW_ASSIGN_OR_RAISE(auto fn, PlatformFilename::FromString(select.base_dir));
+  std::vector<FileInfo> results;
+  RETURN_NOT_OK(StatSelector(fn, select, 0, &results));
+  return results;
 }
 
-// FileInfoGenerator LocalFileSystem::GetFileInfoGenerator(const FileSelector& select) {
-//   RETURN_NOT_OK(ValidatePath(select.base_dir));
-//   ARROW_ASSIGN_OR_RAISE(
-//       auto fileinfo_gen,
-//       AsyncStatSelector::DiscoverPartitions(shared_from_this(), select,
-//       StatOptions{}));
-//   return fileinfo_gen;
-// }
+FileInfoGenerator LocalFileSystem::GetFileInfoGenerator(const FileSelector& select) {
+  auto path_status = ValidatePath(select.base_dir);
+  if (!path_status.ok()) {
+    return MakeFailingGenerator<FileInfoVector>(path_status);
+  }
+  auto fileinfo_gen =
+      AsyncStatSelector::DiscoverPartitionsFlattened(select, StatOptions{});
+  if (!fileinfo_gen.ok()) {
+    return MakeFailingGenerator<FileInfoVector>(fileinfo_gen.status());
+  }
+  return fileinfo_gen.MoveValueUnsafe();
+}
 
 Status LocalFileSystem::CreateDir(const std::string& path, bool recursive) {
   RETURN_NOT_OK(ValidatePath(path));

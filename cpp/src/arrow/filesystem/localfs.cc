@@ -332,13 +332,6 @@ bool StartsWithAnyOf(const std::string& path, const std::vector<std::string>& pr
 }
 
 struct StatOptions {
-  /// Invalid files (via selector or explicitly) will be excluded by checking
-  /// with the FileFormat::IsSupported method.  This will incur IO for each files
-  /// in a serial and single threaded fashion. Disabling this feature will skip the
-  /// IO, but unsupported files may be present in the Dataset
-  /// (resulting in an error at scan time).
-  bool exclude_invalid_files = false;
-
   /// When discovering from a Selector (and not from an explicit file list), ignore
   /// files and directories matching any of these prefixes.
   ///
@@ -367,8 +360,19 @@ class AsyncStatSelector {
       FileSelector selector, const StatOptions& opts) {
     PushGenerator<FileInfoGenerator> file_gen;
 
-    auto filter_fn = [selector, opts](const FileInfo& info) {
-      return FileFilter(info, selector, opts);
+    auto filter_fn = [selector, opts](const FileInfo& info) -> Result<bool> {
+      if (!info.IsFile()) {
+        return false;
+      }
+      auto relative = fs::internal::RemoveAncestor(selector.base_dir, info.path());
+      if (!relative) {
+        return Status::Invalid("GetFileInfo() yielded path '", info.path(),
+                               "', which is outside base dir '", selector.base_dir, "'");
+      }
+      if (StartsWithAnyOf(std::string(*relative), opts.selector_ignore_prefixes)) {
+        return false;
+      }
+      return true;
     };
 
     ARROW_ASSIGN_OR_RAISE(
@@ -511,27 +515,6 @@ class AsyncStatSelector {
     ARROW_RETURN_IF(!file_gen_producer.Push(std::move(gen)),
                     arrow::Status::Cancelled("Discovery cancelled"));
     return arrow::Status::OK();
-  }
-
-  static Result<bool> FileFilter(const FileInfo& info, const FileSelector& selector,
-                                 const StatOptions& opts) {
-    if (!opts.exclude_invalid_files) {
-      return true;
-    }
-    if (!info.IsFile()) {
-      return false;
-    };
-    // ARROW_LOG(DEBUG) << "info " << info.ToString() << " , selector.base_dir "
-    //                  << selector.base_dir;
-    auto relative = fs::internal::RemoveAncestor(selector.base_dir, info.path());
-    if (!relative) {
-      return Status::Invalid("GetFileInfo() yielded path '", info.path(),
-                             "', which is outside base dir '", selector.base_dir, "'");
-    }
-    if (StartsWithAnyOf(std::string(*relative), opts.selector_ignore_prefixes)) {
-      return false;
-    }
-    return true;
   }
 };
 

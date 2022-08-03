@@ -395,18 +395,16 @@ class AsyncStatSelector {
   class DiscoveryImplIterator {
     static constexpr size_t batch_size = 1000;
 
-    PlatformFilename dir_fn_;
-    int32_t nesting_depth_;
-    bool initialized_ = false;
-    std::vector<PlatformFilename> child_fns_;
-    size_t idx_ = 0;
-
-    FilterFn filter_;
+    const PlatformFilename dir_fn_;
+    const int32_t nesting_depth_;
+    const FileSelector selector_;
+    const FilterFn filter_;
 
     SinglePartitionProducer partition_producer_;
-    FileSelector selector_;
-
     FileInfoVector current_chunk_;
+    std::vector<PlatformFilename> child_fns_;
+    size_t idx_ = 0;
+    bool initialized_ = false;
 
    public:
     DiscoveryImplIterator(PlatformFilename dir_fn, int32_t nesting_depth, FilterFn filter,
@@ -414,9 +412,9 @@ class AsyncStatSelector {
                           SinglePartitionProducer partition_producer)
         : dir_fn_(std::move(dir_fn)),
           nesting_depth_(nesting_depth),
+          selector_(std::move(selector)),
           filter_(std::move(filter)),
-          partition_producer_(std::move(partition_producer)),
-          selector_(std::move(selector)) {
+          partition_producer_(std::move(partition_producer)) {
       current_chunk_.reserve(batch_size);
     }
 
@@ -443,7 +441,10 @@ class AsyncStatSelector {
 
     Result<FileInfoVector> Next() {
       if (!initialized_) {
-        RETURN_NOT_OK(Initialize());
+        auto init = Initialize();
+        if (!init.ok()) {
+          return Finish(init);
+        }
       }
       while (idx_ < child_fns_.size()) {
         auto full_fn = dir_fn_.Join(child_fns_[idx_++]);
@@ -456,16 +457,8 @@ class AsyncStatSelector {
 
         if (info.type() == FileType::Directory &&
             nesting_depth_ < selector_.max_recursion && selector_.recursive) {
-          // вот здесь запускается в том же тредпуле еще один дискавери, точнее,
-          // конструируется итератор в субдиректории и из него делается генератор
-          // далее пушатся данные из этого генератора в общий синк.
-          //
-          // тут фишка в том, что opts является супер-аргументом, который не только
-          // options передает, но также и сам синк, а его, по идее, надо бы
-          // перекидывать
-          // явно
-          auto status = PerformDiscovery(full_fn, nesting_depth_ + 1, filter_, selector_,
-                                         partition_producer_);
+          auto status = PerformDiscovery(std::move(full_fn), nesting_depth_ + 1, filter_,
+                                         selector_, partition_producer_);
           if (!status.ok()) {
             return Finish(status);
           }
@@ -478,16 +471,17 @@ class AsyncStatSelector {
         } else if (*check) {
           current_chunk_.emplace_back(std::move(info));
           if (current_chunk_.size() == batch_size) {
-            auto yielded_vec = current_chunk_;
-            current_chunk_.clear();
+            FileInfoVector yielded_vec;
+            std::swap(yielded_vec, current_chunk_);
+            current_chunk_.reserve(batch_size);
             return yielded_vec;
           }
         }
         continue;
       }
       if (!current_chunk_.empty()) {
-        auto yielded_vec = current_chunk_;
-        current_chunk_.clear();
+        FileInfoVector yielded_vec;
+        std::swap(yielded_vec, current_chunk_);
         return yielded_vec;
       }
       return Finish();

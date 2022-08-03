@@ -420,26 +420,30 @@ class AsyncStatSelector {
       current_chunk_.reserve(batch_size);
     }
 
+    Status Initialize() {
+      auto result = arrow::internal::ListDir(dir_fn_);
+      if (!result.ok()) {
+        auto status = result.status();
+        if (selector_.allow_not_found && status.IsIOError()) {
+          auto exists = FileExists(dir_fn_);
+          if (exists.ok() && !*exists) {
+            return Status::OK();
+          } else {
+            return exists.ok() ? arrow::Status::UnknownError(
+                                     "Failed to discover directory: ", dir_fn_.ToNative())
+                               : exists.status();
+          }
+        }
+        return status;
+      }
+      child_fns_ = std::move(result.MoveValueUnsafe());
+      initialized_ = true;
+      return Status::OK();
+    }
+
     Result<FileInfoVector> Next() {
       if (!initialized_) {
-        auto result = arrow::internal::ListDir(dir_fn_);
-        if (!result.ok()) {
-          auto status = result.status();
-          if (selector_.allow_not_found && status.IsIOError()) {
-            auto exists = FileExists(dir_fn_);
-            if (exists.ok() && !*exists) {
-              return Finish();
-            } else {
-              return Finish(
-                  exists.ok() ? arrow::Status::UnknownError(
-                                    "Failed to discover directory: ", dir_fn_.ToNative())
-                              : exists.status());
-            }
-          }
-          return Finish(status);
-        }
-        child_fns_ = std::move(result.MoveValueUnsafe());
-        initialized_ = true;
+        RETURN_NOT_OK(Initialize());
       }
       while (idx_ < child_fns_.size()) {
         auto full_fn = dir_fn_.Join(child_fns_[idx_++]);

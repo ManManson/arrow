@@ -17,6 +17,7 @@
 
 #include <arrow/filesystem/type_fwd.h>
 #include <arrow/io/type_fwd.h>
+#include <arrow/status.h>
 #include <arrow/util/async_generator.h>
 #include <chrono>
 #include <cstring>
@@ -452,7 +453,8 @@ class AsyncStatSelector {
           // далее пушатся данные из этого генератора в общий синк.
           //
           // тут фишка в том, что opts является супер-аргументом, который не только
-          // options передает, но также и сам синк, а его, по идее, надо бы перекидывать
+          // options передает, но также и сам синк, а его, по идее, надо бы
+          // перекидывать
           // явно
           auto status = PerformDiscovery(full_fn, nesting_depth_ + 1, filter_, selector_,
                                          partition_producer_);
@@ -470,14 +472,12 @@ class AsyncStatSelector {
         }
         continue;
       }
-      ARROW_LOG(DEBUG) << "Next(): iterator exhausted for directory "
-                       << dir_fn_.ToString();
       return Finish();
     }
 
    private:
     Result<FileInfo> Finish(Status status = Status::OK()) {
-      assert(partition_producer_.Close());
+      partition_producer_.Close();
       ARROW_RETURN_NOT_OK(status);
       return IterationEnd<FileInfo>();
     }

@@ -317,29 +317,60 @@ Result<FileInfo> LocalFileSystem::GetFileInfo(const std::string& path) {
 
 namespace {
 
+// TODO: Copy-paste from `dataset/discovery.cc`, should be moved to a common
+// place so that this can be reused.
 bool StartsWithAnyOf(const std::string& path, const std::vector<std::string>& prefixes) {
   if (prefixes.empty()) {
     return false;
   }
 
   auto parts = fs::internal::SplitAbstractPath(path);
-  return std::any_of(parts.cbegin(), parts.cend(), [&prefixes](util::string_view part) {
-    return std::any_of(prefixes.cbegin(), prefixes.cend(),
-                       [&part](util::string_view prefix) {
-                         return util::string_view(part).starts_with(prefix);
-                       });
-  });
+  for (const auto& part : parts) {
+    for (const auto& prefix : prefixes) {
+      if (util::string_view(part).starts_with(prefix)) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
+/// Workhorse for streaming async implementation of `GetFileInfo`
+/// (`GetFileInfoGenerator`).
+///
+/// There are two variants of async discovery functions suported:
+/// 1. `DiscoverPartitionFiles`, which parallelizes traversal of individual directories
+///    so that each directory results are yielded as a separate `FileInfoGenerator` via
+///    an underlying `DiscoveryImplIterator`, which delivers items in chunks (default size
+///    is `kBatchSize == 1K` items).
+/// 2. `DiscoverPartitionsFlattened`, which forwards execution to the
+///    `DiscoverPartitionFiles`, with the difference that the results from individual
+///    sub-directory iterators are merged into the single FileInfoGenerator stream.
+///
+/// The implementation makes use of additional attributes in `FileSelector`,
+/// such as `ignore_prefixes`, which can be used to filter undesired results
+/// matching given prefixes.
+///
+/// `FileSelector::partitions_readahead` can also be supplied to tune algorithm
+/// behavior and adjust how many directories can be processed in parallel.
+/// This option is disabled by default, so that individual partitions are processed
+/// in serial manner via `MakeConcatenatedGenerator` under the hood.
 class AsyncStatSelector {
  public:
   using FilterFn = std::function<Result<bool>(const FileInfo&)>;
   using FileInfoGeneratorProducer = PushGenerator<FileInfoGenerator>::Producer;
 
+  /// The main procedure to start async streaming discovery using a given `FileSelector`.
+  ///
+  /// The result is a two-level generator, i.e. "generator of FileInfoGenerator:s",
+  /// where each individual generator represents an FileInfo item stream from coming an
+  /// individual sub-directory under the selector's `base_dir`.
   static Result<AsyncGenerator<FileInfoGenerator>> DiscoverPartitionFiles(
       FileSelector selector) {
     PushGenerator<FileInfoGenerator> file_gen;
 
+    /// Filter function makes use of `selector.ignore_prefixes` to specify path
+    /// patterns, which should not be included in the resulting stream.
     auto filter_fn = [selector](const FileInfo& info) -> Result<bool> {
       if (!info.IsFile()) {
         return false;
@@ -364,6 +395,10 @@ class AsyncStatSelector {
     return file_gen;
   }
 
+  /// Version of `DiscoverPartitionFiles` which flattens the stream of generators
+  /// into a single FileInfoGenerator stream.
+  /// Makes use of `selector.partitions_readahead` to determine how much readahead
+  /// should happen.
   static arrow::Result<FileInfoGenerator> DiscoverPartitionsFlattened(
       FileSelector selector) {
     ARROW_ASSIGN_OR_RAISE(auto part_gen, DiscoverPartitionFiles(std::move(selector)));
@@ -374,7 +409,12 @@ class AsyncStatSelector {
   }
 
  private:
+  /// The class, which implements iterator interface to traverse a given
+  /// directory at the fixed nesting depth, and possibly recurses into
+  /// sub-directories (if specified by the selector), spawning more
+  /// `DiscoveryImplIterators`, which feed their data into a single producer.
   class DiscoveryImplIterator {
+    // Default chunk size to yield in a single `Next()` invocation.
     static constexpr uint32_t kBatchSize = 1000u;
 
     const PlatformFilename dir_fn_;
@@ -400,6 +440,8 @@ class AsyncStatSelector {
       current_chunk_.reserve(kBatchSize);
     }
 
+    /// Pre-initialize the iterator by listing directory contents and caching
+    /// in the current instance.
     Status Initialize() {
       auto result = arrow::internal::ListDir(dir_fn_);
       if (!result.ok()) {
@@ -437,6 +479,7 @@ class AsyncStatSelector {
 
         auto info = res.MoveValueUnsafe();
 
+        // Try to recurse into subdirectories, if needed.
         if (info.type() == FileType::Directory &&
             nesting_depth_ < selector_.max_recursion && selector_.recursive) {
           auto status = DoDiscovery(std::move(full_fn), nesting_depth_ + 1, filter_,
@@ -446,21 +489,27 @@ class AsyncStatSelector {
           }
           continue;
         }
-
+        // Check if the current item satisfies the filter condition.
         auto check = filter_(info);
         if (!check.ok()) {
           return Finish(check.status());
-        } else if (*check) {
-          current_chunk_.emplace_back(std::move(info));
-          if (current_chunk_.size() == kBatchSize) {
-            FileInfoVector yield_vec;
-            std::swap(yield_vec, current_chunk_);
-            current_chunk_.reserve(kBatchSize);
-            return yield_vec;
-          }
         }
-        continue;
-      }
+        if (!*check) {
+          continue;
+        }
+        // Everything is ok. Add the item to the current chunk of data.
+        current_chunk_.emplace_back(std::move(info));
+        // Keep `current_chunk_` as large, as `kBatchSize`.
+        // Otherwise, yield the complete chunk to the caller.
+        if (current_chunk_.size() == kBatchSize) {
+          FileInfoVector yield_vec;
+          std::swap(yield_vec, current_chunk_);
+          current_chunk_.reserve(kBatchSize);
+          return yield_vec;
+        }
+      }  // while (idx_ < child_fns_.size())
+
+      // Flush out remaining items
       if (!current_chunk_.empty()) {
         FileInfoVector yield_vec;
         std::swap(yield_vec, current_chunk_);
@@ -470,6 +519,7 @@ class AsyncStatSelector {
     }
 
    private:
+    /// Close the producer end of stream and return iteration end marker.
     Result<FileInfoVector> Finish(Status status = Status::OK()) {
       file_gen_producer_.Close();
       ARROW_RETURN_NOT_OK(status);
@@ -477,8 +527,9 @@ class AsyncStatSelector {
     }
   };
 
-  // Create a DiscoveryImplIterator under the hood, convert to a generator
-  // feed it to the outer PushGenerator's producer queue (Discover(3))
+  /// Create an instance of  `DiscoveryImplIterator` under the hood for the
+  /// specified directory, wrap it in the `BackgroundGenerator + TransferredGenerator`
+  /// bundle and feed the results to the main producer queue.
   static Status DoDiscovery(const PlatformFilename& dir_fn, int32_t nesting_depth,
                             FilterFn filter, FileSelector selector,
                             FileInfoGeneratorProducer file_gen_producer) {

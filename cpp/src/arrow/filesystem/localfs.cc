@@ -347,8 +347,6 @@ struct StatOptions {
       ".",
       "_",
   };
-  /// How many partitions should be processed in parallel.
-  int32_t partitions_readahead = 1;
 };
 
 class AsyncStatSelector {
@@ -387,9 +385,9 @@ class AsyncStatSelector {
       FileSelector selector, const StatOptions& opts) {
     ARROW_ASSIGN_OR_RAISE(auto part_gen,
                           DiscoverPartitionFiles(std::move(selector), opts));
-    return opts.partitions_readahead > 1
-               ? MakeSequencedMergedGenerator(std::move(part_gen),
-                                              opts.partitions_readahead)
+    int32_t partitions_readahead = selector.partitions_readahead.value_or(1);
+    return partitions_readahead > 1
+               ? MakeSequencedMergedGenerator(std::move(part_gen), partitions_readahead)
                : MakeConcatenatedGenerator(std::move(part_gen));
   }
 

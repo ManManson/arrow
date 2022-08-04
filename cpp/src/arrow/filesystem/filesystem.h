@@ -31,6 +31,7 @@
 #include "arrow/type_fwd.h"
 #include "arrow/util/compare.h"
 #include "arrow/util/macros.h"
+#include "arrow/util/optional.h"
 #include "arrow/util/type_fwd.h"
 #include "arrow/util/visibility.h"
 #include "arrow/util/windows_fixup.h"
@@ -132,6 +133,8 @@ struct ARROW_EXPORT FileSelector {
   bool recursive;
   /// The maximum number of subdirectories to recurse into.
   int32_t max_recursion;
+  /// How many partitions should be processed in parallel.
+  util::optional<int32_t> partitions_readahead;
 
   FileSelector() : allow_not_found(false), recursive(false), max_recursion(INT32_MAX) {}
 };

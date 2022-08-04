@@ -395,7 +395,7 @@ class AsyncStatSelector {
 
  private:
   class DiscoveryImplIterator {
-    static constexpr size_t batch_size = 1000;
+    static constexpr uint32_t kBatchSize = 1000u;
 
     const PlatformFilename dir_fn_;
     const int32_t nesting_depth_;
@@ -417,7 +417,7 @@ class AsyncStatSelector {
           selector_(std::move(selector)),
           filter_(std::move(filter)),
           file_gen_producer_(std::move(file_gen_producer)) {
-      current_chunk_.reserve(batch_size);
+      current_chunk_.reserve(kBatchSize);
     }
 
     Status Initialize() {
@@ -472,19 +472,19 @@ class AsyncStatSelector {
           return Finish(check.status());
         } else if (*check) {
           current_chunk_.emplace_back(std::move(info));
-          if (current_chunk_.size() == batch_size) {
-            FileInfoVector yielded_vec;
-            std::swap(yielded_vec, current_chunk_);
-            current_chunk_.reserve(batch_size);
-            return yielded_vec;
+          if (current_chunk_.size() == kBatchSize) {
+            FileInfoVector yield_vec;
+            std::swap(yield_vec, current_chunk_);
+            current_chunk_.reserve(kBatchSize);
+            return yield_vec;
           }
         }
         continue;
       }
       if (!current_chunk_.empty()) {
-        FileInfoVector yielded_vec;
-        std::swap(yielded_vec, current_chunk_);
-        return yielded_vec;
+        FileInfoVector yield_vec;
+        std::swap(yield_vec, current_chunk_);
+        return yield_vec;
       }
       return Finish();
     }

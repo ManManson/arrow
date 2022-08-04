@@ -135,6 +135,18 @@ struct ARROW_EXPORT FileSelector {
   int32_t max_recursion;
   /// How many partitions should be processed in parallel.
   util::optional<int32_t> partitions_readahead;
+  /// When discovering from a Selector (and not from an explicit file list), ignore
+  /// files and directories matching any of these prefixes.
+  ///
+  /// Example (with selector = "/dataset/**"):
+  /// selector_ignore_prefixes = {"_", ".DS_STORE" };
+  ///
+  /// - "/dataset/data.csv" -> not ignored
+  /// - "/dataset/_metadata" -> ignored
+  /// - "/dataset/.DS_STORE" -> ignored
+  /// - "/dataset/_hidden/dat" -> ignored
+  /// - "/dataset/nested/.DS_STORE" -> ignored
+  util::optional<std::vector<std::string>> ignore_prefixes;
 
   FileSelector() : allow_not_found(false), recursive(false), max_recursion(INT32_MAX) {}
 };

@@ -331,34 +331,16 @@ bool StartsWithAnyOf(const std::string& path, const std::vector<std::string>& pr
   });
 }
 
-struct StatOptions {
-  /// When discovering from a Selector (and not from an explicit file list), ignore
-  /// files and directories matching any of these prefixes.
-  ///
-  /// Example (with selector = "/dataset/**"):
-  /// selector_ignore_prefixes = {"_", ".DS_STORE" };
-  ///
-  /// - "/dataset/data.csv" -> not ignored
-  /// - "/dataset/_metadata" -> ignored
-  /// - "/dataset/.DS_STORE" -> ignored
-  /// - "/dataset/_hidden/dat" -> ignored
-  /// - "/dataset/nested/.DS_STORE" -> ignored
-  std::vector<std::string> selector_ignore_prefixes = {
-      ".",
-      "_",
-  };
-};
-
 class AsyncStatSelector {
  public:
   using FilterFn = std::function<Result<bool>(const FileInfo&)>;
   using FileInfoGeneratorProducer = PushGenerator<FileInfoGenerator>::Producer;
 
   static Result<AsyncGenerator<FileInfoGenerator>> DiscoverPartitionFiles(
-      FileSelector selector, const StatOptions& opts) {
+      FileSelector selector) {
     PushGenerator<FileInfoGenerator> file_gen;
 
-    auto filter_fn = [selector, opts](const FileInfo& info) -> Result<bool> {
+    auto filter_fn = [selector](const FileInfo& info) -> Result<bool> {
       if (!info.IsFile()) {
         return false;
       }
@@ -367,7 +349,8 @@ class AsyncStatSelector {
         return Status::Invalid("GetFileInfo() yielded path '", info.path(),
                                "', which is outside base dir '", selector.base_dir, "'");
       }
-      if (StartsWithAnyOf(std::string(*relative), opts.selector_ignore_prefixes)) {
+      if (selector.ignore_prefixes &&
+          StartsWithAnyOf(std::string(*relative), *selector.ignore_prefixes)) {
         return false;
       }
       return true;
@@ -382,9 +365,8 @@ class AsyncStatSelector {
   }
 
   static arrow::Result<FileInfoGenerator> DiscoverPartitionsFlattened(
-      FileSelector selector, const StatOptions& opts) {
-    ARROW_ASSIGN_OR_RAISE(auto part_gen,
-                          DiscoverPartitionFiles(std::move(selector), opts));
+      FileSelector selector) {
+    ARROW_ASSIGN_OR_RAISE(auto part_gen, DiscoverPartitionFiles(std::move(selector)));
     int32_t partitions_readahead = selector.partitions_readahead.value_or(1);
     return partitions_readahead > 1
                ? MakeSequencedMergedGenerator(std::move(part_gen), partitions_readahead)
@@ -531,8 +513,7 @@ FileInfoGenerator LocalFileSystem::GetFileInfoGenerator(const FileSelector& sele
   if (!path_status.ok()) {
     return MakeFailingGenerator<FileInfoVector>(path_status);
   }
-  auto fileinfo_gen =
-      AsyncStatSelector::DiscoverPartitionsFlattened(select, StatOptions{});
+  auto fileinfo_gen = AsyncStatSelector::DiscoverPartitionsFlattened(select);
   if (!fileinfo_gen.ok()) {
     return MakeFailingGenerator<FileInfoVector>(fileinfo_gen.status());
   }

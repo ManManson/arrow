@@ -28,6 +28,7 @@
 #include "arrow/compute/exec/expression.h"
 #include "arrow/dataset/type_fwd.h"
 #include "arrow/dataset/visibility.h"
+#include "arrow/util/async_generator_fwd.h"
 #include "arrow/util/macros.h"
 #include "arrow/util/mutex.h"
 #include "arrow/util/optional.h"
@@ -134,6 +135,8 @@ class ARROW_DS_EXPORT InMemoryFragment : public Fragment {
 
 /// @}
 
+using FragmentGenerator = AsyncGenerator<std::shared_ptr<Fragment>>;
+
 /// \brief A container of zero or more Fragments.
 ///
 /// A Dataset acts as a union of Fragments, e.g. files deeply nested in a
@@ -147,6 +150,10 @@ class ARROW_DS_EXPORT Dataset : public std::enable_shared_from_this<Dataset> {
   /// \brief GetFragments returns an iterator of Fragments given a predicate.
   Result<FragmentIterator> GetFragments(compute::Expression predicate);
   Result<FragmentIterator> GetFragments();
+
+  /// \brief Async versions of `GetFragments`.
+  Result<FragmentGenerator> GetFragmentsAsync(compute::Expression predicate);
+  Result<FragmentGenerator> GetFragmentsAsync();
 
   const std::shared_ptr<Schema>& schema() const { return schema_; }
 
@@ -174,6 +181,7 @@ class ARROW_DS_EXPORT Dataset : public std::enable_shared_from_this<Dataset> {
   Dataset(std::shared_ptr<Schema> schema, compute::Expression partition_expression);
 
   virtual Result<FragmentIterator> GetFragmentsImpl(compute::Expression predicate) = 0;
+  virtual Result<FragmentGenerator> GetFragmentsAsyncImpl(compute::Expression predicate);
 
   std::shared_ptr<Schema> schema_;
   compute::Expression partition_expression_ = compute::literal(true);

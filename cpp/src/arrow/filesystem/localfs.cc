@@ -38,7 +38,6 @@
 #include "arrow/io/type_fwd.h"
 #include "arrow/util/async_generator.h"
 #include "arrow/util/io_util.h"
-#include "arrow/util/logging.h"
 #include "arrow/util/uri.h"
 #include "arrow/util/windows_fixup.h"
 
@@ -248,7 +247,7 @@ LocalFileSystemOptions LocalFileSystemOptions::Defaults() {
 
 bool LocalFileSystemOptions::Equals(const LocalFileSystemOptions& other) const {
   return use_mmap == other.use_mmap && directory_readahead == other.directory_readahead &&
-         batch_size == other.batch_size;
+         file_info_batch_size == other.file_info_batch_size;
 }
 
 Result<LocalFileSystemOptions> LocalFileSystemOptions::FromUri(
@@ -349,7 +348,7 @@ class AsyncStatSelector {
     ARROW_ASSIGN_OR_RAISE(
         auto base_dir, arrow::internal::PlatformFilename::FromString(selector.base_dir));
     ARROW_RETURN_NOT_OK(DoDiscovery(std::move(base_dir), 0, std::move(selector),
-                                    file_gen.producer(), fs_opts.batch_size));
+                                    file_gen.producer(), fs_opts.file_info_batch_size));
 
     return file_gen;
   }
@@ -377,7 +376,7 @@ class AsyncStatSelector {
     const PlatformFilename dir_fn_;
     const int32_t nesting_depth_;
     const FileSelector selector_;
-    const uint32_t batch_size_;
+    const uint32_t file_info_batch_size_;
 
     FileInfoGeneratorProducer file_gen_producer_;
     FileInfoVector current_chunk_;
@@ -389,11 +388,11 @@ class AsyncStatSelector {
     DiscoveryImplIterator(PlatformFilename dir_fn, int32_t nesting_depth,
                           FileSelector selector,
                           FileInfoGeneratorProducer file_gen_producer,
-                          uint32_t batch_size)
+                          uint32_t file_info_batch_size)
         : dir_fn_(std::move(dir_fn)),
           nesting_depth_(nesting_depth),
           selector_(std::move(selector)),
-          batch_size_(batch_size),
+          file_info_batch_size_(file_info_batch_size),
           file_gen_producer_(std::move(file_gen_producer)) {}
 
     /// Pre-initialize the iterator by listing directory contents and caching
@@ -403,13 +402,9 @@ class AsyncStatSelector {
       if (!result.ok()) {
         auto status = result.status();
         if (selector_.allow_not_found && status.IsIOError()) {
-          auto exists = FileExists(dir_fn_);
-          if (exists.ok() && !*exists) {
+          ARROW_ASSIGN_OR_RAISE(bool exists, FileExists(dir_fn_));
+          if (!exists) {
             return Status::OK();
-          } else {
-            return exists.ok() ? arrow::Status::UnknownError(
-                                     "Failed to discover directory: ", dir_fn_.ToString())
-                               : exists.status();
           }
         }
         return status;
@@ -417,7 +412,8 @@ class AsyncStatSelector {
       child_fns_ = result.MoveValueUnsafe();
 
       const size_t dirent_count = child_fns_.size();
-      current_chunk_.reserve(dirent_count >= batch_size_ ? batch_size_ : dirent_count);
+      current_chunk_.reserve(dirent_count >= file_info_batch_size_ ? file_info_batch_size_
+                                                                   : dirent_count);
 
       initialized_ = true;
       return Status::OK();
@@ -443,7 +439,7 @@ class AsyncStatSelector {
         if (info.type() == FileType::Directory &&
             nesting_depth_ < selector_.max_recursion && selector_.recursive) {
           auto status = DoDiscovery(std::move(full_fn), nesting_depth_ + 1, selector_,
-                                    file_gen_producer_, batch_size_);
+                                    file_gen_producer_, file_info_batch_size_);
           if (!status.ok()) {
             return Finish(status);
           }
@@ -452,20 +448,19 @@ class AsyncStatSelector {
         current_chunk_.emplace_back(std::move(info));
         // Keep `current_chunk_` as large, as `batch_size_`.
         // Otherwise, yield the complete chunk to the caller.
-        if (current_chunk_.size() == batch_size_) {
+        if (current_chunk_.size() == file_info_batch_size_) {
           FileInfoVector yield_vec;
           std::swap(yield_vec, current_chunk_);
           const size_t items_left = child_fns_.size() - idx_;
-          current_chunk_.reserve(items_left >= batch_size_ ? batch_size_ : items_left);
+          current_chunk_.reserve(
+              items_left >= file_info_batch_size_ ? file_info_batch_size_ : items_left);
           return yield_vec;
         }
       }  // while (idx_ < child_fns_.size())
 
       // Flush out remaining items
       if (!current_chunk_.empty()) {
-        FileInfoVector yield_vec;
-        std::swap(yield_vec, current_chunk_);
-        return yield_vec;
+        return std::move(current_chunk_);
       }
       return Finish();
     }
@@ -485,7 +480,7 @@ class AsyncStatSelector {
   static Status DoDiscovery(const PlatformFilename& dir_fn, int32_t nesting_depth,
                             FileSelector selector,
                             FileInfoGeneratorProducer file_gen_producer,
-                            uint32_t batch_size) {
+                            int32_t batch_size) {
     ARROW_RETURN_IF(file_gen_producer.is_closed(),
                     arrow::Status::Cancelled("Discovery cancelled"));
 

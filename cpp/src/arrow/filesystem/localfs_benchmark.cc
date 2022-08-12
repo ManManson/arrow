@@ -116,21 +116,35 @@ class LocalFSFixture : public benchmark::Fixture {
   size_t num_files_ = 1000;  // 10000
 };
 
-BENCHMARK_F(LocalFSFixture, DiscoverWithoutReadahead_DefaultBatchSize)
+BENCHMARK_DEFINE_F(LocalFSFixture, AsyncFileDiscovery)
 (benchmark::State& st) {
-  FileSelector select;
-  select.base_dir = tmp_dir_->path().ToString();
-  select.recursive = true;
-  auto file_gen = fs_->GetFileInfoGenerator(std::move(select));
-  size_t total_file_count = 0;
-  auto visit_fut =
-      VisitAsyncGenerator(file_gen, [&total_file_count](const FileInfoVector& fv) {
-        total_file_count += fv.size();
-        return Status::OK();
-      });
-  ASSERT_FINISHES_OK(visit_fut);
-  st.SetItemsProcessed(total_file_count);
+  for (auto _ : st) {
+    auto options = LocalFileSystemOptions::Defaults();
+    options.directory_readahead = st.range(0);
+    options.file_info_batch_size = st.range(1);
+    auto test_fs = make_unique<LocalFileSystem>(options);
+
+    FileSelector select;
+    select.base_dir = tmp_dir_->path().ToString();
+    select.recursive = true;
+    auto file_gen = test_fs->GetFileInfoGenerator(std::move(select));
+    size_t total_file_count = 0;
+    auto visit_fut =
+        VisitAsyncGenerator(file_gen, [&total_file_count](const FileInfoVector& fv) {
+          total_file_count += fv.size();
+          return Status::OK();
+        });
+    ASSERT_FINISHES_OK(visit_fut);
+    st.SetItemsProcessed(total_file_count);
+  }
 }
+BENCHMARK_REGISTER_F(LocalFSFixture, AsyncFileDiscovery)
+    // arg0: directory_readahead
+    // arg1: file_info_batch_size
+    ->ArgNames({"directory_readahead", "file_info_batch_size"})
+    ->ArgsProduct({{1, 2, 4, 8, 16}, {1, 10, 100, 1000}})
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond);
 
 }  // namespace fs
 

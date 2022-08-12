@@ -17,6 +17,7 @@
 
 #include <chrono>
 #include <cstring>
+#include <memory>
 #include <sstream>
 #include <utility>
 
@@ -336,6 +337,35 @@ class AsyncStatSelector {
  public:
   using FileInfoGeneratorProducer = PushGenerator<FileInfoGenerator>::Producer;
 
+  class AutoClosingProducer {
+   public:
+    explicit AutoClosingProducer(FileInfoGeneratorProducer producer)
+        : state_(std::make_shared<State>(std::move(producer))) {}
+
+    bool Push(arrow::Result<FileInfoGenerator> value) {
+      return state_ && state_->Push(std::move(value));
+    }
+
+    void Finish() { state_.reset(); }
+
+    bool IsFinished() { return !state_; }
+
+   private:
+    struct State {
+      State(FileInfoGeneratorProducer producer) : wrapped(std::move(producer)) {}
+
+      ~State() { wrapped.Close(); }
+
+      bool Push(arrow::Result<FileInfoGenerator> value) {
+        return wrapped.Push(std::move(value));
+      }
+
+      FileInfoGeneratorProducer wrapped;
+    };
+
+    std::shared_ptr<State> state_;
+  };
+
   /// The main procedure to start async streaming discovery using a given `FileSelector`.
   ///
   /// The result is a two-level generator, i.e. "generator of FileInfoGenerator:s",
@@ -348,7 +378,8 @@ class AsyncStatSelector {
     ARROW_ASSIGN_OR_RAISE(
         auto base_dir, arrow::internal::PlatformFilename::FromString(selector.base_dir));
     ARROW_RETURN_NOT_OK(DoDiscovery(std::move(base_dir), 0, std::move(selector),
-                                    file_gen.producer(), fs_opts.file_info_batch_size));
+                                    AutoClosingProducer(file_gen.producer()),
+                                    fs_opts.file_info_batch_size));
 
     return file_gen;
   }
@@ -378,7 +409,7 @@ class AsyncStatSelector {
     const FileSelector selector_;
     const uint32_t file_info_batch_size_;
 
-    FileInfoGeneratorProducer file_gen_producer_;
+    AutoClosingProducer file_gen_producer_;
     FileInfoVector current_chunk_;
     std::vector<PlatformFilename> child_fns_;
     size_t idx_ = 0;
@@ -386,8 +417,7 @@ class AsyncStatSelector {
 
    public:
     DiscoveryImplIterator(PlatformFilename dir_fn, int32_t nesting_depth,
-                          FileSelector selector,
-                          FileInfoGeneratorProducer file_gen_producer,
+                          FileSelector selector, AutoClosingProducer file_gen_producer,
                           uint32_t file_info_batch_size)
         : dir_fn_(std::move(dir_fn)),
           nesting_depth_(nesting_depth),
@@ -468,7 +498,7 @@ class AsyncStatSelector {
    private:
     /// Close the producer end of stream and return iteration end marker.
     Result<FileInfoVector> Finish(Status status = Status::OK()) {
-      file_gen_producer_.Close();
+      file_gen_producer_.Finish();
       ARROW_RETURN_NOT_OK(status);
       return IterationEnd<FileInfoVector>();
     }
@@ -478,10 +508,9 @@ class AsyncStatSelector {
   /// specified directory, wrap it in the `BackgroundGenerator + TransferredGenerator`
   /// bundle and feed the results to the main producer queue.
   static Status DoDiscovery(const PlatformFilename& dir_fn, int32_t nesting_depth,
-                            FileSelector selector,
-                            FileInfoGeneratorProducer file_gen_producer,
+                            FileSelector selector, AutoClosingProducer file_gen_producer,
                             int32_t batch_size) {
-    ARROW_RETURN_IF(file_gen_producer.is_closed(),
+    ARROW_RETURN_IF(file_gen_producer.IsFinished(),
                     arrow::Status::Cancelled("Discovery cancelled"));
 
     ARROW_ASSIGN_OR_RAISE(
